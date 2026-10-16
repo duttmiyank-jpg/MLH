@@ -22,12 +22,19 @@ import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
-    private val modelId = "gemma-4-31b-it"
+    // List of candidate models in order of priority (Gemma 4 primary, fallback to Gemma 2 / Gemini Flash)
+    private val candidateModels = listOf(
+        "gemma-4-31b-it",
+        "gemma-2-27b-it",
+        "gemma-2-9b-it",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    )
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -35,83 +42,48 @@ class GemmaApiService(private val context: Context) {
         symptoms: String,
         imageUri: Uri?
     ): Result<CropAnalysisResult> = withContext(Dispatchers.IO) {
-        try {
-            val apiKey = BuildConfig.GEMMA_API_KEY
-            if (apiKey.isBlank()) {
-                return@withContext Result.failure(
-                    Exception("Gemma API Key local.properties me nahi mila! Kripya GEMMA_API_KEY set karein.")
-                )
-            }
-
-            val endpointUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
-            val promptText = buildPrompt(cropType, symptoms, imageUri != null)
-
-            val partsArray = JSONArray()
-
-            // Text part
-            val textPart = JSONObject().apply {
-                put("text", promptText)
-            }
-            partsArray.put(textPart)
-
-            // Image part (if selected)
-            if (imageUri != null) {
-                val base64Image = uriToBase64(imageUri)
-                if (base64Image != null) {
-                    val inlineData = JSONObject().apply {
-                        put("mimeType", "image/jpeg")
-                        put("data", base64Image)
-                    }
-                    val imagePart = JSONObject().apply {
-                        put("inlineData", inlineData)
-                    }
-                    partsArray.put(imagePart)
-                }
-            }
-
-            val contentsArray = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", partsArray)
-                })
-            }
-
-            val requestBodyJson = JSONObject().apply {
-                put("contents", contentsArray)
-                put("generationConfig", JSONObject().apply {
-                    put("temperature", 0.3)
-                    put("maxOutputTokens", 1024)
-                })
-            }
-
-            val mediaType = "application/json; charset=utf-8".toMediaType()
-            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
-
-            val request = Request.Builder()
-                .url(endpointUrl)
-                .post(requestBody)
-                .build()
-
-            val response = okHttpClient.newCall(request).execute()
-            val responseBodyString = response.body?.string() ?: ""
-
-            if (response.isSuccessful) {
-                if (responseBodyString.isBlank()) {
-                    return@withContext Result.failure(Exception("Gemma API ne khali response bheja."))
-                }
-                val parsedResult = parseGemmaResponse(responseBodyString)
-                if (parsedResult != null) {
-                    Result.success(parsedResult)
-                } else {
-                    Result.failure(Exception("Gemma AI response ko parse nahi kiya ja saka."))
-                }
-            } else {
-                val errorMsg = parseErrorMessage(response.code, responseBodyString)
-                Result.failure(Exception(errorMsg))
-            }
-
-        } catch (e: Exception) {
-            Result.failure(e)
+        val apiKey = BuildConfig.GEMMA_API_KEY
+        if (apiKey.isBlank()) {
+            return@withContext Result.failure(
+                Exception("Gemma API Key local.properties me nahi mila! Kripya GEMMA_API_KEY set karein.")
+            )
         }
+
+        val base64Image = if (imageUri != null) uriToBase64(imageUri) else null
+        val promptText = buildPrompt(cropType, symptoms, base64Image != null)
+        val requestBodyJson = buildRequestBody(promptText, base64Image)
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+
+        var lastError = "Unknown Error"
+
+        // Try candidate models in order until one succeeds
+        for (modelId in candidateModels) {
+            try {
+                val endpointUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
+                val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
+
+                val request = Request.Builder()
+                    .url(endpointUrl)
+                    .post(requestBody)
+                    .build()
+
+                val response = okHttpClient.newCall(request).execute()
+                val responseBodyString = response.body?.string() ?: ""
+
+                if (response.isSuccessful && responseBodyString.isNotBlank()) {
+                    val parsedResult = parseGemmaResponse(responseBodyString)
+                    if (parsedResult != null) {
+                        return@withContext Result.success(parsedResult)
+                    }
+                } else {
+                    lastError = parseErrorMessage(response.code, responseBodyString, modelId)
+                }
+            } catch (e: Exception) {
+                lastError = "Network error ($modelId): ${e.localizedMessage ?: e.message}"
+            }
+        }
+
+        Result.failure(Exception(lastError))
     }
 
     private fun buildPrompt(cropType: CropType, symptoms: String, hasImage: Boolean): String {
@@ -123,7 +95,7 @@ class GemmaApiService(private val context: Context) {
             - Photo di gayi hai: ${if (hasImage) "Haan (image attached)" else "Nahi"}
 
             Kripya niche diye gaye format me HI Hinglish (Hindi text in Roman alphabet) me jawab dein.
-            Bohot hi saral aur helpful bhasha use karein.
+            Bohot hi saral aur helpful bhasha me kisan ko salah dein.
 
             [SAMASYA]
             (Fasal ki samasya ya rog ka spasht vivran 1-2 line me Hinglish me)
@@ -139,6 +111,40 @@ class GemmaApiService(private val context: Context) {
             [AGLA_KADAM]
             (Kisan ko abhi turant kya karna chahiye - Hinglish me short salah)
         """.trimIndent()
+    }
+
+    private fun buildRequestBody(promptText: String, base64Image: String?): JSONObject {
+        val partsArray = JSONArray()
+
+        // Text part
+        partsArray.put(JSONObject().apply {
+            put("text", promptText)
+        })
+
+        // Image inline data part (if present)
+        if (base64Image != null) {
+            val inlineData = JSONObject().apply {
+                put("mimeType", "image/jpeg")
+                put("data", base64Image)
+            }
+            partsArray.put(JSONObject().apply {
+                put("inlineData", inlineData)
+            })
+        }
+
+        val contentsArray = JSONArray().apply {
+            put(JSONObject().apply {
+                put("parts", partsArray)
+            })
+        }
+
+        return JSONObject().apply {
+            put("contents", contentsArray)
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.3)
+                put("maxOutputTokens", 1024)
+            })
+        }
     }
 
     private fun parseGemmaResponse(jsonResponse: String): CropAnalysisResult? {
@@ -197,7 +203,6 @@ class GemmaApiService(private val context: Context) {
             if (content.isNotEmpty()) nextSteps = content
         }
 
-        // If structured tags weren't used by LLM, fall back to entire text as issue
         if (causes.isEmpty() && remedies.isEmpty()) {
             issue = text.take(300)
             causes.add("Poshak tatva ki kami ya patton me rog")
@@ -213,14 +218,14 @@ class GemmaApiService(private val context: Context) {
         )
     }
 
-    private fun parseErrorMessage(code: Int, body: String): String {
+    private fun parseErrorMessage(code: Int, body: String, modelId: String): String {
         return try {
             val root = JSONObject(body)
             val errorObj = root.optJSONObject("error")
             val message = errorObj?.optString("message") ?: body
-            "Gemma API Error ($code): $message"
+            "Model $modelId Error ($code): $message"
         } catch (e: Exception) {
-            "Gemma API Network Error ($code)"
+            "Model $modelId Error ($code)"
         }
     }
 
@@ -229,7 +234,8 @@ class GemmaApiService(private val context: Context) {
             val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
             val originalBitmap = BitmapFactory.decodeStream(inputStream) ?: return null
 
-            val maxDimension = 1024
+            // Downscale to 512px max dimension to ensure instant payload transmission over mobile network
+            val maxDimension = 512
             val width = originalBitmap.width
             val height = originalBitmap.height
             val scale = (maxDimension.toFloat() / Math.max(width, height)).coerceAtMost(1.0f)
@@ -242,7 +248,7 @@ class GemmaApiService(private val context: Context) {
             )
 
             val outputStream = ByteArrayOutputStream()
-            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
+            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream)
             val byteArray = outputStream.toByteArray()
             Base64.encodeToString(byteArray, Base64.NO_WRAP)
         } catch (e: Exception) {
