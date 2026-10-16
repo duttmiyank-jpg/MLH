@@ -22,19 +22,13 @@ import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
-    // List of candidate models in order of priority (Gemma 4 primary, fallback to Gemma 2 / Gemini Flash)
-    private val candidateModels = listOf(
-        "gemma-4-31b-it",
-        "gemma-2-27b-it",
-        "gemma-2-9b-it",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash"
-    )
+    // Strictly target Gemma 4 model ID
+    private val modelId = "gemma-4-31b-it"
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -54,36 +48,32 @@ class GemmaApiService(private val context: Context) {
         val requestBodyJson = buildRequestBody(promptText, base64Image)
         val mediaType = "application/json; charset=utf-8".toMediaType()
 
-        var lastError = "Unknown Error"
+        val endpointUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
 
-        // Try candidate models in order until one succeeds
-        for (modelId in candidateModels) {
-            try {
-                val endpointUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
-                val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
+        try {
+            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
+            val request = Request.Builder()
+                .url(endpointUrl)
+                .post(requestBody)
+                .build()
 
-                val request = Request.Builder()
-                    .url(endpointUrl)
-                    .post(requestBody)
-                    .build()
+            val response = okHttpClient.newCall(request).execute()
+            val responseBodyString = response.body?.string() ?: ""
 
-                val response = okHttpClient.newCall(request).execute()
-                val responseBodyString = response.body?.string() ?: ""
-
-                if (response.isSuccessful && responseBodyString.isNotBlank()) {
-                    val parsedResult = parseGemmaResponse(responseBodyString)
-                    if (parsedResult != null) {
-                        return@withContext Result.success(parsedResult)
-                    }
+            if (response.isSuccessful && responseBodyString.isNotBlank()) {
+                val parsedResult = parseGemmaResponse(responseBodyString)
+                if (parsedResult != null) {
+                    Result.success(parsedResult)
                 } else {
-                    lastError = parseErrorMessage(response.code, responseBodyString, modelId)
+                    Result.failure(Exception("Gemma 4 AI response ko parse nahi kiya ja saka."))
                 }
-            } catch (e: Exception) {
-                lastError = "Network error ($modelId): ${e.localizedMessage ?: e.message}"
+            } else {
+                val errorMsg = parseErrorMessage(response.code, responseBodyString)
+                Result.failure(Exception(errorMsg))
             }
+        } catch (e: Exception) {
+            Result.failure(Exception("Network error ($modelId): ${e.localizedMessage ?: e.message}"))
         }
-
-        Result.failure(Exception(lastError))
     }
 
     private fun buildPrompt(cropType: CropType, symptoms: String, hasImage: Boolean): String {
@@ -218,7 +208,7 @@ class GemmaApiService(private val context: Context) {
         )
     }
 
-    private fun parseErrorMessage(code: Int, body: String, modelId: String): String {
+    private fun parseErrorMessage(code: Int, body: String): String {
         return try {
             val root = JSONObject(body)
             val errorObj = root.optJSONObject("error")
@@ -234,7 +224,6 @@ class GemmaApiService(private val context: Context) {
             val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
             val originalBitmap = BitmapFactory.decodeStream(inputStream) ?: return null
 
-            // Downscale to 512px max dimension to ensure instant payload transmission over mobile network
             val maxDimension = 512
             val width = originalBitmap.width
             val height = originalBitmap.height
