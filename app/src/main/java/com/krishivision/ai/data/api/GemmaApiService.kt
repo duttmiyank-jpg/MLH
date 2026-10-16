@@ -26,20 +26,22 @@ import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
-    // Target Gemma models in order (Gemma 4 primary, fallback to official Gemma 2 models)
+    private val TAG = "GemmaApiService"
+
+    // Supported Gemma models in priority order (Gemma 4 primary, fallback to low-latency Gemma 2 models)
     private val gemmaModels = listOf(
         "gemma-4-31b-it",
-        "gemma-2-27b-it",
         "gemma-2-9b-it",
+        "gemma-2-27b-it",
         "gemma-2-2b-it"
     )
 
     private val expectedHost = "generativelanguage.googleapis.com"
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -65,7 +67,7 @@ class GemmaApiService(private val context: Context) {
             val endpointUrl = "https://$expectedHost/v1beta/models/$modelId:generateContent?key=$apiKey"
             val parsedUrl = endpointUrl.toHttpUrlOrNull() ?: continue
 
-            // First attempt: with image inlineData if present
+            // Attempt 1: with image if present
             var requestBodyJson = buildRequestBody(promptText, base64Image)
             var result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
 
@@ -73,9 +75,10 @@ class GemmaApiService(private val context: Context) {
                 return@withContext result
             }
 
-            // If 400 Bad Request occurred with image (due to text-only model), retry with text-only payload
-            if (base64Image != null && result.exceptionOrNull()?.message?.contains("400") == true) {
-                Log.d("GemmaApiService", "Retrying $modelId with text-only payload...")
+            // Attempt 2: text-only if image caused 400 Bad Request
+            val errMessage = result.exceptionOrNull()?.message ?: ""
+            if (base64Image != null && (errMessage.contains("400") || errMessage.contains("inlineData"))) {
+                Log.d(TAG, "Retrying $modelId with text-only payload...")
                 requestBodyJson = buildRequestBody(promptText, null)
                 result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
                 if (result.isSuccess) {
@@ -95,6 +98,11 @@ class GemmaApiService(private val context: Context) {
         mediaType: okhttp3.MediaType,
         modelId: String
     ): Result<CropAnalysisResult> {
+        val startTime = System.currentTimeMillis()
+        val safePath = parsedUrl.encodedPath // Path without API key query param
+
+        Log.d(TAG, "Request Start -> Model: $modelId, Host: ${parsedUrl.host}, Path: $safePath")
+
         return try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
             val request = Request.Builder()
@@ -103,28 +111,37 @@ class GemmaApiService(private val context: Context) {
                 .build()
 
             val response = okHttpClient.newCall(request).execute()
+            val duration = System.currentTimeMillis() - startTime
             val responseBodyString = response.body?.string() ?: ""
+
+            Log.d(TAG, "Response Recv -> Model: $modelId, Code: ${response.code}, Duration: ${duration}ms")
 
             if (response.isSuccessful && responseBodyString.isNotBlank()) {
                 val parsedResult = parseGemmaResponse(responseBodyString)
                 if (parsedResult != null) {
                     Result.success(parsedResult)
                 } else {
-                    Result.failure(Exception("Gemma AI ($modelId) response ko parse nahi kiya ja saka."))
+                    Result.failure(Exception("Gemma AI ($modelId) response body empty or malformed."))
                 }
             } else {
                 val errorMsg = parseErrorMessage(response.code, responseBodyString, modelId)
                 Result.failure(Exception(errorMsg))
             }
         } catch (e: UnknownHostException) {
+            val duration = System.currentTimeMillis() - startTime
+            Log.e(TAG, "UnknownHostException after ${duration}ms for $modelId", e)
             Result.failure(
                 Exception("Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua! Kripya Internet chalu karein.")
             )
         } catch (e: SocketTimeoutException) {
+            val duration = System.currentTimeMillis() - startTime
+            Log.e(TAG, "SocketTimeoutException after ${duration}ms for $modelId", e)
             Result.failure(
-                Exception("Gemma AI Server timeout hua (30s). Kripya dobara koshish karein.")
+                Exception("Model $modelId server timeout ($duration ms). Fast response ke liye dobara try karein.")
             )
         } catch (e: Exception) {
+            val duration = System.currentTimeMillis() - startTime
+            Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms for $modelId", e)
             Result.failure(
                 Exception("Network Error ($modelId): ${e.localizedMessage ?: e.message}")
             )
