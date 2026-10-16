@@ -27,21 +27,12 @@ import java.util.concurrent.TimeUnit
 class GemmaApiService(private val context: Context) {
 
     private val TAG = "GemmaApiService"
-
-    // Supported Gemma models in priority order (Gemma 4 primary, fallback to low-latency Gemma 2 models)
-    private val gemmaModels = listOf(
-        "gemma-4-31b-it",
-        "gemma-2-9b-it",
-        "gemma-2-27b-it",
-        "gemma-2-2b-it"
-    )
-
     private val expectedHost = "generativelanguage.googleapis.com"
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -56,52 +47,106 @@ class GemmaApiService(private val context: Context) {
             )
         }
 
+        // Step 1: Discover verified models available to this API key
+        val availableModels = fetchAvailableModels(apiKey)
+        if (availableModels.isEmpty()) {
+            return@withContext Result.failure(
+                Exception("Google AI API se supported models list nahi mila. Kripya API Key aur Internet connection check karein.")
+            )
+        }
+
+        Log.d(TAG, "Discovered ${availableModels.size} generateContent models for this API key: $availableModels")
+
+        // Filter for Gemma model or pick best available Gemma model from official Google list
+        val selectedModel = availableModels.firstOrNull { it.contains("gemma", ignoreCase = true) }
+            ?: return@withContext Result.failure(
+                Exception("Aapki API key par koi Gemma model available nahi hai. Available models: $availableModels")
+            )
+
+        Log.d(TAG, "Selected verified Gemma model: $selectedModel")
+
         val base64Image = if (imageUri != null) uriToBase64(imageUri) else null
         val promptText = buildPrompt(cropType, symptoms, base64Image != null)
         val mediaType = "application/json; charset=utf-8".toMediaType()
 
-        var lastError = "Gemma API connection fail hua."
+        // Construct exact generateContent endpoint using verified model name
+        val endpointUrl = "https://$expectedHost/v1beta/$selectedModel:generateContent?key=$apiKey"
+        val parsedUrl = endpointUrl.toHttpUrlOrNull()
+            ?: return@withContext Result.failure(Exception("Malformed API URL for $selectedModel"))
 
-        // Iterate over Gemma models
-        for (modelId in gemmaModels) {
-            val endpointUrl = "https://$expectedHost/v1beta/models/$modelId:generateContent?key=$apiKey"
-            val parsedUrl = endpointUrl.toHttpUrlOrNull() ?: continue
+        // First attempt with image (if present)
+        var requestBodyJson = buildRequestBody(promptText, base64Image)
+        var result = executeApiCall(parsedUrl, requestBodyJson, mediaType, selectedModel)
 
-            // Attempt 1: with image if present
-            var requestBodyJson = buildRequestBody(promptText, base64Image)
-            var result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
-
-            if (result.isSuccess) {
-                return@withContext result
-            }
-
-            // Attempt 2: text-only if image caused 400 Bad Request
+        // If image caused 400 Bad Request (text-only model), retry with text prompt
+        if (!result.isSuccess && base64Image != null) {
             val errMessage = result.exceptionOrNull()?.message ?: ""
-            if (base64Image != null && (errMessage.contains("400") || errMessage.contains("inlineData"))) {
-                Log.d(TAG, "Retrying $modelId with text-only payload...")
+            if (errMessage.contains("400") || errMessage.contains("inlineData")) {
+                Log.d(TAG, "Retrying $selectedModel with text-only payload...")
                 requestBodyJson = buildRequestBody(promptText, null)
-                result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
-                if (result.isSuccess) {
-                    return@withContext result
-                }
+                result = executeApiCall(parsedUrl, requestBodyJson, mediaType, selectedModel)
             }
-
-            lastError = result.exceptionOrNull()?.message ?: lastError
         }
 
-        Result.failure(Exception(lastError))
+        result
+    }
+
+    private fun fetchAvailableModels(apiKey: String): List<String> {
+        val listUrl = "https://$expectedHost/v1beta/models?key=$apiKey"
+        val parsedUrl = listUrl.toHttpUrlOrNull() ?: return emptyList()
+
+        return try {
+            val request = Request.Builder().url(parsedUrl).get().build()
+            val startTime = System.currentTimeMillis()
+            val response = okHttpClient.newCall(request).execute()
+            val duration = System.currentTimeMillis() - startTime
+            val bodyString = response.body?.string() ?: ""
+
+            Log.d(TAG, "Model List Response Code: ${response.code}, Duration: ${duration}ms")
+
+            if (response.isSuccessful && bodyString.isNotBlank()) {
+                val root = JSONObject(bodyString)
+                val modelsArray = root.optJSONArray("models") ?: JSONArray()
+                val resultList = mutableListOf<String>()
+
+                for (i in 0 until modelsArray.length()) {
+                    val modelObj = modelsArray.getJSONObject(i)
+                    val modelName = modelObj.optString("name", "") // e.g. "models/gemma-2-9b-it"
+                    val methods = modelObj.optJSONArray("supportedGenerationMethods") ?: JSONArray()
+
+                    var supportsGenerateContent = false
+                    for (j in 0 until methods.length()) {
+                        if (methods.getString(j) == "generateContent") {
+                            supportsGenerateContent = true
+                            break
+                        }
+                    }
+
+                    if (supportsGenerateContent && modelName.isNotBlank()) {
+                        resultList.add(modelName)
+                    }
+                }
+                resultList
+            } else {
+                Log.e(TAG, "Failed to fetch models list ($response.code): $bodyString")
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception fetching model list: ${e.message}", e)
+            emptyList()
+        }
     }
 
     private fun executeApiCall(
         parsedUrl: okhttp3.HttpUrl,
         requestBodyJson: JSONObject,
         mediaType: okhttp3.MediaType,
-        modelId: String
+        modelName: String
     ): Result<CropAnalysisResult> {
         val startTime = System.currentTimeMillis()
-        val safePath = parsedUrl.encodedPath // Path without API key query param
+        val safePath = parsedUrl.encodedPath
 
-        Log.d(TAG, "Request Start -> Model: $modelId, Host: ${parsedUrl.host}, Path: $safePath")
+        Log.d(TAG, "GenerateContent Request Start -> Model: $modelName, Path: $safePath")
 
         return try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
@@ -114,36 +159,33 @@ class GemmaApiService(private val context: Context) {
             val duration = System.currentTimeMillis() - startTime
             val responseBodyString = response.body?.string() ?: ""
 
-            Log.d(TAG, "Response Recv -> Model: $modelId, Code: ${response.code}, Duration: ${duration}ms")
+            Log.d(TAG, "GenerateContent Response Code: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
 
             if (response.isSuccessful && responseBodyString.isNotBlank()) {
                 val parsedResult = parseGemmaResponse(responseBodyString)
                 if (parsedResult != null) {
                     Result.success(parsedResult)
                 } else {
-                    Result.failure(Exception("Gemma AI ($modelId) response body empty or malformed."))
+                    Result.failure(Exception("Gemma AI ($modelName) response format invalid."))
                 }
             } else {
-                val errorMsg = parseErrorMessage(response.code, responseBodyString, modelId)
+                val errorMsg = parseErrorMessage(response.code, responseBodyString, modelName)
                 Result.failure(Exception(errorMsg))
             }
         } catch (e: UnknownHostException) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "UnknownHostException after ${duration}ms for $modelId", e)
+            Log.e(TAG, "UnknownHostException for $modelName", e)
             Result.failure(
                 Exception("Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua! Kripya Internet chalu karein.")
             )
         } catch (e: SocketTimeoutException) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "SocketTimeoutException after ${duration}ms for $modelId", e)
+            Log.e(TAG, "SocketTimeoutException for $modelName", e)
             Result.failure(
-                Exception("Model $modelId server timeout ($duration ms). Fast response ke liye dobara try karein.")
+                Exception("Model $modelName server timeout. Kripya dobara try karein.")
             )
         } catch (e: Exception) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms for $modelId", e)
+            Log.e(TAG, "Exception (${e.javaClass.simpleName}) for $modelName", e)
             Result.failure(
-                Exception("Network Error ($modelId): ${e.localizedMessage ?: e.message}")
+                Exception("Network Error ($modelName): ${e.localizedMessage ?: e.message}")
             )
         }
     }
@@ -178,12 +220,10 @@ class GemmaApiService(private val context: Context) {
     private fun buildRequestBody(promptText: String, base64Image: String?): JSONObject {
         val partsArray = JSONArray()
 
-        // Text part
         partsArray.put(JSONObject().apply {
             put("text", promptText)
         })
 
-        // Image inline data part (if present)
         if (base64Image != null) {
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -280,14 +320,14 @@ class GemmaApiService(private val context: Context) {
         )
     }
 
-    private fun parseErrorMessage(code: Int, body: String, modelId: String): String {
+    private fun parseErrorMessage(code: Int, body: String, modelName: String): String {
         return try {
             val root = JSONObject(body)
             val errorObj = root.optJSONObject("error")
             val message = errorObj?.optString("message") ?: body
-            "Model $modelId Error ($code): $message"
+            "Model $modelName Error ($code): $message"
         } catch (e: Exception) {
-            "Model $modelId Error ($code)"
+            "Model $modelName Error ($code)"
         }
     }
 
