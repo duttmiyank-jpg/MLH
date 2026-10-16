@@ -10,16 +10,25 @@ import com.krishivision.ai.data.model.CropAnalysisResult
 import com.krishivision.ai.data.model.CropType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
     private val modelId = "gemma-4-31b-it"
+
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     suspend fun analyzeCrop(
         cropType: CropType,
@@ -30,7 +39,7 @@ class GemmaApiService(private val context: Context) {
             val apiKey = BuildConfig.GEMMA_API_KEY
             if (apiKey.isBlank()) {
                 return@withContext Result.failure(
-                    Exception("Gemma API key nahi mila! Kripya local.properties me GEMMA_API_KEY add karein.")
+                    Exception("Gemma API Key local.properties me nahi mila! Kripya GEMMA_API_KEY set karein.")
                 )
             }
 
@@ -66,7 +75,7 @@ class GemmaApiService(private val context: Context) {
                 })
             }
 
-            val requestBody = JSONObject().apply {
+            val requestBodyJson = JSONObject().apply {
                 put("contents", contentsArray)
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.3)
@@ -74,28 +83,30 @@ class GemmaApiService(private val context: Context) {
                 })
             }
 
-            val url = URL(endpointUrl)
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                doOutput = true
-                connectTimeout = 15000
-                readTimeout = 20000
-            }
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
 
-            connection.outputStream.use { os ->
-                val input = requestBody.toString().toByteArray(Charsets.UTF_8)
-                os.write(input, 0, input.size)
-            }
+            val request = Request.Builder()
+                .url(endpointUrl)
+                .post(requestBody)
+                .build()
 
-            val responseCode = connection.responseCode
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
-                val parsedResult = parseGemmaResponse(responseText)
-                Result.success(parsedResult)
+            val response = okHttpClient.newCall(request).execute()
+            val responseBodyString = response.body?.string() ?: ""
+
+            if (response.isSuccessful) {
+                if (responseBodyString.isBlank()) {
+                    return@withContext Result.failure(Exception("Gemma API ne khali response bheja."))
+                }
+                val parsedResult = parseGemmaResponse(responseBodyString)
+                if (parsedResult != null) {
+                    Result.success(parsedResult)
+                } else {
+                    Result.failure(Exception("Gemma AI response ko parse nahi kiya ja saka."))
+                }
             } else {
-                val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP Error $responseCode"
-                Result.failure(Exception("AI Service Error ($responseCode): $errorText"))
+                val errorMsg = parseErrorMessage(response.code, responseBodyString)
+                Result.failure(Exception(errorMsg))
             }
 
         } catch (e: Exception) {
@@ -126,12 +137,12 @@ class GemmaApiService(private val context: Context) {
             - (Point 2: Doosra upay)
 
             [AGLA_KADAM]
-            (Kisan ko abhi turant kya karna chahiye - Hinglish me short सलाह)
+            (Kisan ko abhi turant kya karna chahiye - Hinglish me short salah)
         """.trimIndent()
     }
 
-    private fun parseGemmaResponse(jsonResponse: String): CropAnalysisResult {
-        try {
+    private fun parseGemmaResponse(jsonResponse: String): CropAnalysisResult? {
+        return try {
             val rootObj = JSONObject(jsonResponse)
             val candidates = rootObj.optJSONArray("candidates")
             if (candidates != null && candidates.length() > 0) {
@@ -139,19 +150,15 @@ class GemmaApiService(private val context: Context) {
                 val parts = content?.optJSONArray("parts")
                 if (parts != null && parts.length() > 0) {
                     val fullText = parts.getJSONObject(0).optString("text", "")
-                    return extractStructuredSections(fullText)
+                    if (fullText.isNotBlank()) {
+                        return extractStructuredSections(fullText)
+                    }
                 }
             }
+            null
         } catch (e: Exception) {
-            // Fallthrough to raw text fallback
+            null
         }
-        return CropAnalysisResult(
-            detectedIssue = "Gemma 4 dwara fasal ka vishleshan poora hua.",
-            possibleCauses = listOf("Sahi poshan ki kami", "Mausam me badlav ya keede"),
-            remedies = listOf("Kripya fasal ki dekhbhal karein aur mitti ki jaanch karayein."),
-            nextSteps = "Sthaniya krishi kendra se sampark karein.",
-            rawResponse = jsonResponse
-        )
     }
 
     private fun extractStructuredSections(text: String): CropAnalysisResult {
@@ -190,8 +197,12 @@ class GemmaApiService(private val context: Context) {
             if (content.isNotEmpty()) nextSteps = content
         }
 
-        if (causes.isEmpty()) causes.add("Poshak tatva ki kami ya patton me rog")
-        if (remedies.isEmpty()) remedies.add("Sahi pani aur keetnashak ka istemal karein")
+        // If structured tags weren't used by LLM, fall back to entire text as issue
+        if (causes.isEmpty() && remedies.isEmpty()) {
+            issue = text.take(300)
+            causes.add("Poshak tatva ki kami ya patton me rog")
+            remedies.add("Sahi pani aur keetnashak ka istemal karein")
+        }
 
         return CropAnalysisResult(
             detectedIssue = issue,
@@ -202,17 +213,27 @@ class GemmaApiService(private val context: Context) {
         )
     }
 
+    private fun parseErrorMessage(code: Int, body: String): String {
+        return try {
+            val root = JSONObject(body)
+            val errorObj = root.optJSONObject("error")
+            val message = errorObj?.optString("message") ?: body
+            "Gemma API Error ($code): $message"
+        } catch (e: Exception) {
+            "Gemma API Network Error ($code)"
+        }
+    }
+
     private fun uriToBase64(uri: Uri): String? {
         return try {
             val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
             val originalBitmap = BitmapFactory.decodeStream(inputStream) ?: return null
-            
-            // Resize bitmap if too large to fit in REST payload
+
             val maxDimension = 1024
             val width = originalBitmap.width
             val height = originalBitmap.height
             val scale = (maxDimension.toFloat() / Math.max(width, height)).coerceAtMost(1.0f)
-            
+
             val scaledBitmap = Bitmap.createScaledBitmap(
                 originalBitmap,
                 (width * scale).toInt(),
