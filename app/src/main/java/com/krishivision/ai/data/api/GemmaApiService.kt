@@ -1,7 +1,10 @@
 package com.krishivision.ai.data.api
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.Base64
 import android.util.Log
 import com.krishivision.ai.BuildConfig
 import com.krishivision.ai.data.model.CropAnalysisResult
@@ -15,6 +18,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -27,8 +32,8 @@ class GemmaApiService(private val context: Context) {
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -48,30 +53,37 @@ class GemmaApiService(private val context: Context) {
             ?: return@withContext Result.failure(Exception("Malformed API URL for $targetModelId"))
 
         val mediaType = "application/json; charset=utf-8".toMediaType()
+        val base64Image = if (imageUri != null) uriToBase64(imageUri) else null
+        val promptText = buildPrompt(cropType, symptoms, base64Image != null)
 
-        // Construct minimal diagnostic request payload as specified
-        val requestBodyJson = JSONObject().apply {
-            put("contents", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("text", "Reply with OK in Hinglish.")
-                        })
-                    })
-                })
-            })
-            put("generationConfig", JSONObject().apply {
-                put("temperature", 0.2)
-                put("maxOutputTokens", 128)
-            })
+        // First attempt with image inlineData if present
+        var requestBodyJson = buildRequestBody(promptText, base64Image)
+        var result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
+
+        // Retry with text-only payload if image inlineData was rejected with HTTP 400
+        if (!result.isSuccess && base64Image != null) {
+            val errMsg = result.exceptionOrNull()?.message ?: ""
+            if (errMsg.contains("400") || errMsg.contains("inlineData")) {
+                Log.d(TAG, "Retrying $targetModelId with text-only payload...")
+                requestBodyJson = buildRequestBody(promptText, null)
+                result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
+            }
         }
 
+        result
+    }
+
+    private fun executeApiCall(
+        parsedUrl: okhttp3.HttpUrl,
+        requestBodyJson: JSONObject,
+        mediaType: okhttp3.MediaType
+    ): Result<CropAnalysisResult> {
         val startTime = System.currentTimeMillis()
         val safePath = parsedUrl.encodedPath // Path without API key parameter
 
         Log.d(TAG, "Request Start -> Model: $targetModelId, Host: ${parsedUrl.host}, Path: $safePath")
 
-        try {
+        return try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
             val request = Request.Builder()
                 .url(parsedUrl)
@@ -82,8 +94,8 @@ class GemmaApiService(private val context: Context) {
             val duration = System.currentTimeMillis() - startTime
             val responseBodyString = response.body?.string() ?: ""
 
-            // Safe logging of HTTP status code and response body (NEVER logging the API key)
-            Log.d(TAG, "HTTP Response -> Model: $targetModelId, Status: ${response.code}, Duration: ${duration}ms, Body: $responseBodyString")
+            // Safe logging of HTTP status code and response body length (NEVER logging the API key)
+            Log.d(TAG, "HTTP Response -> Model: $targetModelId, Status: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
 
             if (response.isSuccessful && responseBodyString.isNotBlank()) {
                 val parsedResult = parseGemmaResponse(responseBodyString)
@@ -91,7 +103,7 @@ class GemmaApiService(private val context: Context) {
                     Result.success(parsedResult)
                 } else {
                     Result.failure(
-                        Exception("Model $targetModelId responded with HTTP 200 OK, but response payload was unparseable: $responseBodyString")
+                        Exception("Model $targetModelId HTTP 200 OK diya par response parsing nahi ho saki.")
                     )
                 }
             } else {
@@ -102,20 +114,80 @@ class GemmaApiService(private val context: Context) {
             val duration = System.currentTimeMillis() - startTime
             Log.e(TAG, "UnknownHostException after ${duration}ms for $targetModelId", e)
             Result.failure(
-                Exception("Network Error: Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua ($targetModelId).")
+                Exception("Network Error: Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua.")
             )
         } catch (e: SocketTimeoutException) {
             val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "SocketTimeoutException (Client Read Timeout) after ${duration}ms for $targetModelId", e)
+            Log.e(TAG, "SocketTimeoutException after ${duration}ms for $targetModelId", e)
             Result.failure(
-                Exception("Client-side Read Timeout ($duration ms): Model $targetModelId ne $duration ms me response nahi diya.")
+                Exception("Gemma AI Server read timeout ($duration ms). Kripya dobara try karein.")
             )
         } catch (e: Exception) {
             val duration = System.currentTimeMillis() - startTime
             Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms for $targetModelId", e)
             Result.failure(
-                Exception("Client Exception (${e.javaClass.simpleName}): ${e.localizedMessage ?: e.message}")
+                Exception("Network Error: ${e.localizedMessage ?: e.message}")
             )
+        }
+    }
+
+    private fun buildPrompt(cropType: CropType, symptoms: String, hasImage: Boolean): String {
+        return """
+            Aap ek expert krishi (agricultural) AI sahayak hain.
+            Kisan ne apni fasal ka vivran diya hai:
+            - Fasal: ${cropType.displayNameHinglish}
+            - Kehna/Symptoms: $symptoms
+            - Photo di gayi hai: ${if (hasImage) "Haan (image attached)" else "Nahi"}
+
+            Kripya niche diye gaye format me HI Hinglish (Hindi text in Roman alphabet) me jawab dein.
+            Bohot hi saral, spasht aur helpful bhasha me kisan ko salah dein.
+            Agar jaankari kam lage toh spasht batayein aur surakshit kheti ke upay batayein.
+
+            [SAMASYA]
+            (Pehchani gayi sambhavit samasya ya rog ka 1-2 line me Hinglish me vivran)
+
+            [KARAN]
+            - (Point 1: Sambhavit karan ya keede/bimari ka prabhav Hinglish me)
+            - (Point 2: Doosra karan agar ho)
+
+            [UPAY]
+            - (Point 1: Bachav aur kheti ke sateek upay Hinglish me)
+            - (Point 2: Doosra surakshit upay ya dawai)
+
+            [AGLA_KADAM]
+            (Kisan ko abhi turant kya karna chahiye - Hinglish me short salah)
+        """.trimIndent()
+    }
+
+    private fun buildRequestBody(promptText: String, base64Image: String?): JSONObject {
+        val partsArray = JSONArray()
+
+        partsArray.put(JSONObject().apply {
+            put("text", promptText)
+        })
+
+        if (base64Image != null) {
+            val inlineData = JSONObject().apply {
+                put("mimeType", "image/jpeg")
+                put("data", base64Image)
+            }
+            partsArray.put(JSONObject().apply {
+                put("inlineData", inlineData)
+            })
+        }
+
+        val contentsArray = JSONArray().apply {
+            put(JSONObject().apply {
+                put("parts", partsArray)
+            })
+        }
+
+        return JSONObject().apply {
+            put("contents", contentsArray)
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.3)
+                put("maxOutputTokens", 1024)
+            })
         }
     }
 
@@ -129,13 +201,7 @@ class GemmaApiService(private val context: Context) {
                 if (parts != null && parts.length() > 0) {
                     val fullText = parts.getJSONObject(0).optString("text", "")
                     if (fullText.isNotBlank()) {
-                        return CropAnalysisResult(
-                            detectedIssue = "Gemma AI Response Received: $fullText",
-                            possibleCauses = listOf("Model: $targetModelId test successful."),
-                            remedies = listOf("Status: OK in Hinglish."),
-                            nextSteps = "Minimal diagnostic test passed.",
-                            rawResponse = jsonResponse
-                        )
+                        return extractStructuredSections(fullText)
                     }
                 }
             }
@@ -143,6 +209,57 @@ class GemmaApiService(private val context: Context) {
         } catch (e: Exception) {
             null
         }
+    }
+
+    private fun extractStructuredSections(text: String): CropAnalysisResult {
+        var issue = "Fasal me samasya pehchani gayi."
+        val causes = mutableListOf<String>()
+        val remedies = mutableListOf<String>()
+        var nextSteps = "Kripya krishi visheshagya se salah lein."
+
+        val samasyaMatch = Regex("\\[SAMASYA]([\\s\\S]*?)(?=\\[KARAN]|\$)").find(text)
+        if (samasyaMatch != null) {
+            val content = samasyaMatch.groupValues[1].trim()
+            if (content.isNotEmpty()) issue = content
+        }
+
+        val karanMatch = Regex("\\[KARAN]([\\s\\S]*?)(?=\\[UPAY]|\$)").find(text)
+        if (karanMatch != null) {
+            val lines = karanMatch.groupValues[1].trim().lines()
+            for (line in lines) {
+                val cleaned = line.replace(Regex("^[-*•\\d.]+\\s*"), "").trim()
+                if (cleaned.isNotEmpty()) causes.add(cleaned)
+            }
+        }
+
+        val upayMatch = Regex("\\[UPAY]([\\s\\S]*?)(?=\\[AGLA_KADAM]|\$)").find(text)
+        if (upayMatch != null) {
+            val lines = upayMatch.groupValues[1].trim().lines()
+            for (line in lines) {
+                val cleaned = line.replace(Regex("^[-*•\\d.]+\\s*"), "").trim()
+                if (cleaned.isNotEmpty()) remedies.add(cleaned)
+            }
+        }
+
+        val aglaKadamMatch = Regex("\\[AGLA_KADAM]([\\s\\S]*?)\$").find(text)
+        if (aglaKadamMatch != null) {
+            val content = aglaKadamMatch.groupValues[1].trim()
+            if (content.isNotEmpty()) nextSteps = content
+        }
+
+        if (causes.isEmpty() && remedies.isEmpty()) {
+            issue = text.take(300)
+            causes.add("Poshak tatva ki kami ya keede/patton me rog")
+            remedies.add("Sahi pani aur surakshit keetnashak ka istemal karein")
+        }
+
+        return CropAnalysisResult(
+            detectedIssue = issue,
+            possibleCauses = causes,
+            remedies = remedies,
+            nextSteps = nextSteps,
+            rawResponse = text
+        )
     }
 
     private fun parseErrorMessage(code: Int, body: String): String {
@@ -160,6 +277,32 @@ class GemmaApiService(private val context: Context) {
             }
         } catch (e: Exception) {
             "HTTP $code Error ($targetModelId): $body"
+        }
+    }
+
+    private fun uriToBase64(uri: Uri): String? {
+        return try {
+            val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
+            val originalBitmap = BitmapFactory.decodeStream(inputStream) ?: return null
+
+            val maxDimension = 512
+            val width = originalBitmap.width
+            val height = originalBitmap.height
+            val scale = (maxDimension.toFloat() / Math.max(width, height)).coerceAtMost(1.0f)
+
+            val scaledBitmap = Bitmap.createScaledBitmap(
+                originalBitmap,
+                (width * scale).toInt(),
+                (height * scale).toInt(),
+                true
+            )
+
+            val outputStream = ByteArrayOutputStream()
+            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream)
+            val byteArray = outputStream.toByteArray()
+            Base64.encodeToString(byteArray, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            null
         }
     }
 }
