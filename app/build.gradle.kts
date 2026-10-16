@@ -10,7 +10,7 @@ val localPropertiesFile = rootProject.file("local.properties")
 if (localPropertiesFile.exists()) {
     localProperties.load(localPropertiesFile.inputStream())
 }
-val gemmaApiKey: String = localProperties.getProperty("GEMMA_API_KEY") ?: ""
+val gemmaApiKey: String = (localProperties.getProperty("GEMMA_API_KEY") ?: "").trim()
 
 android {
     namespace = "com.krishivision.ai"

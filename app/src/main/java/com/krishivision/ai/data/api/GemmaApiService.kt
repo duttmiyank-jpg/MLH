@@ -5,11 +5,13 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Base64
+import android.util.Log
 import com.krishivision.ai.BuildConfig
 import com.krishivision.ai.data.model.CropAnalysisResult
 import com.krishivision.ai.data.model.CropType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -18,12 +20,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
-    // Strictly target Gemma 4 model ID
-    private val modelId = "gemma-4-31b-it"
+    private val modelId = "gemma-4-31b-it".trim()
+    private val expectedHost = "generativelanguage.googleapis.com"
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -36,7 +39,7 @@ class GemmaApiService(private val context: Context) {
         symptoms: String,
         imageUri: Uri?
     ): Result<CropAnalysisResult> = withContext(Dispatchers.IO) {
-        val apiKey = BuildConfig.GEMMA_API_KEY
+        val apiKey = BuildConfig.GEMMA_API_KEY.trim()
         if (apiKey.isBlank()) {
             return@withContext Result.failure(
                 Exception("Gemma API Key local.properties me nahi mila! Kripya GEMMA_API_KEY set karein.")
@@ -48,7 +51,16 @@ class GemmaApiService(private val context: Context) {
         val requestBodyJson = buildRequestBody(promptText, base64Image)
         val mediaType = "application/json; charset=utf-8".toMediaType()
 
-        val endpointUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
+        val endpointUrl = "https://$expectedHost/v1beta/models/$modelId:generateContent?key=$apiKey"
+        val parsedUrl = endpointUrl.toHttpUrlOrNull()
+
+        if (parsedUrl == null || parsedUrl.host != expectedHost) {
+            return@withContext Result.failure(
+                Exception("Invalid API Host constructed. Expected $expectedHost")
+            )
+        }
+
+        Log.d("GemmaApiService", "Making HTTPS request to host: ${parsedUrl.host}, path: ${parsedUrl.encodedPath}")
 
         try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
@@ -71,7 +83,13 @@ class GemmaApiService(private val context: Context) {
                 val errorMsg = parseErrorMessage(response.code, responseBodyString)
                 Result.failure(Exception(errorMsg))
             }
+        } catch (e: UnknownHostException) {
+            Log.e("GemmaApiService", "DNS Lookup Failed for ${parsedUrl.host}", e)
+            Result.failure(
+                Exception("Phone ka Internet/Wi-Fi disconnected hai! (Unable to resolve host: ${parsedUrl.host}). Kripya internet chalu karein.")
+            )
         } catch (e: Exception) {
+            Log.e("GemmaApiService", "Network error during Gemma 4 call", e)
             Result.failure(Exception("Network error ($modelId): ${e.localizedMessage ?: e.message}"))
         }
     }
