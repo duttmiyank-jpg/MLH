@@ -640,9 +640,9 @@ fun ResultSection(
             }
         }
 
-        // 3. BACHAV AUR UPAY
+        // 3. SURAKSHIT UPAY
         ResultCard(
-            title = "3. Bachav Aur Upay (Remedies & Prevention)",
+            title = "3. Surakshit Upay (Safe Actions)",
             accentColor = EmeraldAccent
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {

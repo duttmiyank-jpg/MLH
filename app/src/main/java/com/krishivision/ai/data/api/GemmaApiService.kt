@@ -56,15 +56,15 @@ class GemmaApiService(private val context: Context) {
         val base64Image = if (imageUri != null) uriToBase64(imageUri) else null
         val promptText = buildPrompt(cropType, symptoms, base64Image != null)
 
-        // First attempt with image inlineData if present
+        // First attempt: request JSON response with image if present
         var requestBodyJson = buildRequestBody(promptText, base64Image)
         var result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
 
-        // Retry with text-only payload if image inlineData was rejected with HTTP 400
+        // Retry with text-only payload if image payload was rejected with HTTP 400
         if (!result.isSuccess && base64Image != null) {
             val errMsg = result.exceptionOrNull()?.message ?: ""
             if (errMsg.contains("400") || errMsg.contains("inlineData")) {
-                Log.d(TAG, "Retrying $targetModelId with text-only payload...")
+                Log.d(TAG, "Retrying $targetModelId with text-only JSON payload...")
                 requestBodyJson = buildRequestBody(promptText, null)
                 result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
             }
@@ -79,9 +79,9 @@ class GemmaApiService(private val context: Context) {
         mediaType: okhttp3.MediaType
     ): Result<CropAnalysisResult> {
         val startTime = System.currentTimeMillis()
-        val safePath = parsedUrl.encodedPath // Path without API key parameter
+        val safePath = parsedUrl.encodedPath
 
-        Log.d(TAG, "Request Start -> Model: $targetModelId, Host: ${parsedUrl.host}, Path: $safePath")
+        Log.d(TAG, "Request Start -> Model: $targetModelId, Path: $safePath")
 
         return try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
@@ -94,8 +94,7 @@ class GemmaApiService(private val context: Context) {
             val duration = System.currentTimeMillis() - startTime
             val responseBodyString = response.body?.string() ?: ""
 
-            // Safe logging of HTTP status code and response body length (NEVER logging the API key)
-            Log.d(TAG, "HTTP Response -> Model: $targetModelId, Status: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
+            Log.d(TAG, "HTTP Response -> Model: $targetModelId, Code: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
 
             if (response.isSuccessful && responseBodyString.isNotBlank()) {
                 val parsedResult = parseGemmaResponse(responseBodyString)
@@ -103,7 +102,7 @@ class GemmaApiService(private val context: Context) {
                     Result.success(parsedResult)
                 } else {
                     Result.failure(
-                        Exception("Model $targetModelId HTTP 200 OK diya par response parsing nahi ho saki.")
+                        Exception("AI response format me truti aayi. Kripya 'Dobara Koshish Karein' button par click karein.")
                     )
                 }
             } else {
@@ -112,19 +111,19 @@ class GemmaApiService(private val context: Context) {
             }
         } catch (e: UnknownHostException) {
             val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "UnknownHostException after ${duration}ms for $targetModelId", e)
+            Log.e(TAG, "UnknownHostException after ${duration}ms", e)
             Result.failure(
                 Exception("Network Error: Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua.")
             )
         } catch (e: SocketTimeoutException) {
             val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "SocketTimeoutException after ${duration}ms for $targetModelId", e)
+            Log.e(TAG, "SocketTimeoutException after ${duration}ms", e)
             Result.failure(
                 Exception("Gemma AI Server read timeout ($duration ms). Kripya dobara try karein.")
             )
         } catch (e: Exception) {
             val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms for $targetModelId", e)
+            Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms", e)
             Result.failure(
                 Exception("Network Error: ${e.localizedMessage ?: e.message}")
             )
@@ -133,29 +132,35 @@ class GemmaApiService(private val context: Context) {
 
     private fun buildPrompt(cropType: CropType, symptoms: String, hasImage: Boolean): String {
         return """
-            Aap ek expert krishi (agricultural) AI sahayak hain.
-            Kisan ne apni fasal ka vivran diya hai:
+            Aap KrishiVision AI hain, bhartiya kisano ke kheti sahayak.
+            Aapko Hamesha natural Hinglish (Hindi text in Roman alphabet) me jawab dena hai.
+
+            KISAN KA INPUT:
             - Fasal: ${cropType.displayNameHinglish}
-            - Kehna/Symptoms: $symptoms
-            - Photo di gayi hai: ${if (hasImage) "Haan (image attached)" else "Nahi"}
+            - Lakshan/Symptoms: $symptoms
+            - Photo Attached: ${if (hasImage) "Haan (image attached)" else "Nahi"}
 
-            Kripya niche diye gaye format me HI Hinglish (Hindi text in Roman alphabet) me jawab dein.
-            Bohot hi saral, spasht aur helpful bhasha me kisan ko salah dein.
-            Agar jaankari kam lage toh spasht batayein aur surakshit kheti ke upay batayein.
+            OUTPUT FORMAT INSTRUCTIONS:
+            1. KEWAL SHUDDH VALID JSON OBJECT RETURN KAREIN.
+            2. KOI BHI DRAFT, REASONING, CHAIN-OF-THOUGHT, SELF-CORRECTION, MARKDOWN CODE FENCE (```json ... ```), YA TAGS ([SAMASYA], [KARAN]) MAT LIKHEIN.
+            3. Shubh vishleshan aur spasht kheti salah dein.
+            4. AGRICULTURAL SAFETY RULES:
+               - Bina spasht pramaan ke kisi specific keede ya chemical pesticide ki dose confident hokar na batayein.
+               - Agar pramaan kam ho toh spasht uncertainty zaahir karein aur sthaniya krishi kendra (KVK) ya visheshagya se jaanch karayein.
 
-            [SAMASYA]
-            (Pehchani gayi sambhavit samasya ya rog ka 1-2 line me Hinglish me vivran)
-
-            [KARAN]
-            - (Point 1: Sambhavit karan ya keede/bimari ka prabhav Hinglish me)
-            - (Point 2: Doosra karan agar ho)
-
-            [UPAY]
-            - (Point 1: Bachav aur kheti ke sateek upay Hinglish me)
-            - (Point 2: Doosra surakshit upay ya dawai)
-
-            [AGLA_KADAM]
-            (Kisan ko abhi turant kya karna chahiye - Hinglish me short salah)
+            EXACT JSON SCHEMA TO RETURN:
+            {
+              "problem": "(1-2 line me pehchani gayi samasya ya uncertainty ka zikr Hinglish me)",
+              "possibleCauses": [
+                "(Point 1: Sambhavit karan ya lakshan Hinglish me)",
+                "(Point 2: Doosra karan)"
+              ],
+              "safeActions": [
+                "(Point 1: Surakshit kheti upay ya jaanch Hinglish me)",
+                "(Point 2: Doosra surakshit upay)"
+              ],
+              "nextStep": "(Kisan ke liye agla surakshit kadam Hinglish me)"
+            }
         """.trimIndent()
     }
 
@@ -185,8 +190,9 @@ class GemmaApiService(private val context: Context) {
         return JSONObject().apply {
             put("contents", contentsArray)
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.3)
+                put("temperature", 0.2)
                 put("maxOutputTokens", 1024)
+                put("response_mime_type", "application/json")
             })
         }
     }
@@ -201,65 +207,78 @@ class GemmaApiService(private val context: Context) {
                 if (parts != null && parts.length() > 0) {
                     val fullText = parts.getJSONObject(0).optString("text", "")
                     if (fullText.isNotBlank()) {
-                        return extractStructuredSections(fullText)
+                        return parseAndValidateStructuredJson(fullText, jsonResponse)
                     }
                 }
             }
             null
         } catch (e: Exception) {
+            Log.e(TAG, "Gemma root JSON parse error", e)
             null
         }
     }
 
-    private fun extractStructuredSections(text: String): CropAnalysisResult {
-        var issue = "Fasal me samasya pehchani gayi."
-        val causes = mutableListOf<String>()
-        val remedies = mutableListOf<String>()
-        var nextSteps = "Kripya krishi visheshagya se salah lein."
+    private fun parseAndValidateStructuredJson(text: String, rawJson: String): CropAnalysisResult? {
+        return try {
+            // Strip markdown code fences if present (e.g. ```json ... ```)
+            val cleanedText = text.trim()
+                .replace(Regex("^```json\\s*"), "")
+                .replace(Regex("^```\\s*"), "")
+                .replace(Regex("\\s*```$"), "")
+                .trim()
 
-        val samasyaMatch = Regex("\\[SAMASYA]([\\s\\S]*?)(?=\\[KARAN]|\$)").find(text)
-        if (samasyaMatch != null) {
-            val content = samasyaMatch.groupValues[1].trim()
-            if (content.isNotEmpty()) issue = content
-        }
+            val json = JSONObject(cleanedText)
+            val problem = json.optString("problem", "").trim()
+            val nextStep = json.optString("nextStep", "").trim()
 
-        val karanMatch = Regex("\\[KARAN]([\\s\\S]*?)(?=\\[UPAY]|\$)").find(text)
-        if (karanMatch != null) {
-            val lines = karanMatch.groupValues[1].trim().lines()
-            for (line in lines) {
-                val cleaned = line.replace(Regex("^[-*•\\d.]+\\s*"), "").trim()
-                if (cleaned.isNotEmpty()) causes.add(cleaned)
+            val causesArray = json.optJSONArray("possibleCauses")
+            val causesList = mutableListOf<String>()
+            if (causesArray != null) {
+                for (i in 0 until causesArray.length()) {
+                    val cause = causesArray.getString(i).trim()
+                    if (cause.isNotEmpty()) causesList.add(cause)
+                }
             }
-        }
 
-        val upayMatch = Regex("\\[UPAY]([\\s\\S]*?)(?=\\[AGLA_KADAM]|\$)").find(text)
-        if (upayMatch != null) {
-            val lines = upayMatch.groupValues[1].trim().lines()
-            for (line in lines) {
-                val cleaned = line.replace(Regex("^[-*•\\d.]+\\s*"), "").trim()
-                if (cleaned.isNotEmpty()) remedies.add(cleaned)
+            val actionsArray = json.optJSONArray("safeActions")
+            val actionsList = mutableListOf<String>()
+            if (actionsArray != null) {
+                for (i in 0 until actionsArray.length()) {
+                    val action = actionsArray.getString(i).trim()
+                    if (action.isNotEmpty()) actionsList.add(action)
+                }
             }
-        }
 
-        val aglaKadamMatch = Regex("\\[AGLA_KADAM]([\\s\\S]*?)\$").find(text)
-        if (aglaKadamMatch != null) {
-            val content = aglaKadamMatch.groupValues[1].trim()
-            if (content.isNotEmpty()) nextSteps = content
-        }
+            // Validate that fields contain useful text
+            if (problem.length < 3 || causesList.isEmpty() || actionsList.isEmpty() || nextStep.length < 3) {
+                Log.w(TAG, "Validation failed: Fields empty or insufficient length")
+                return null
+            }
 
-        if (causes.isEmpty() && remedies.isEmpty()) {
-            issue = text.take(300)
-            causes.add("Poshak tatva ki kami ya keede/patton me rog")
-            remedies.add("Sahi pani aur surakshit keetnashak ka istemal karein")
-        }
+            // Filter out drafting notes or internal tags if model leaks them
+            val containsDraftingNote = { s: String ->
+                s.contains("Draft", ignoreCase = true) ||
+                        s.contains("Refinement", ignoreCase = true) ||
+                        s.contains("Self-Correction", ignoreCase = true) ||
+                        s.contains("Chain-of-thought", ignoreCase = true)
+            }
 
-        return CropAnalysisResult(
-            detectedIssue = issue,
-            possibleCauses = causes,
-            remedies = remedies,
-            nextSteps = nextSteps,
-            rawResponse = text
-        )
+            if (containsDraftingNote(problem) || containsDraftingNote(nextStep)) {
+                Log.w(TAG, "Validation failed: Internal drafting text leaked into output")
+                return null
+            }
+
+            CropAnalysisResult(
+                detectedIssue = problem,
+                possibleCauses = causesList,
+                remedies = actionsList,
+                nextSteps = nextStep,
+                rawResponse = rawJson
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "JSON parse/validation error: ${e.message}", e)
+            null
+        }
     }
 
     private fun parseErrorMessage(code: Int, body: String): String {
