@@ -10,6 +10,7 @@ import com.krishivision.ai.BuildConfig
 import com.krishivision.ai.data.model.CropAnalysisResult
 import com.krishivision.ai.data.model.CropType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -57,76 +58,100 @@ class GemmaApiService(private val context: Context) {
         val promptText = buildPrompt(cropType, symptoms, base64Image != null)
 
         var requestBodyJson = buildRequestBody(promptText, base64Image)
-        var result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
+        var result = executeApiCallWithRetry(parsedUrl, requestBodyJson, mediaType)
 
-        // Retry with text-only payload if image payload was rejected with HTTP 400
+        // Retry with text-only payload if image payload caused HTTP 500, 400, or server error
         if (!result.isSuccess && base64Image != null) {
             val errMsg = result.exceptionOrNull()?.message ?: ""
-            if (errMsg.contains("400") || errMsg.contains("inlineData")) {
-                Log.d(TAG, "Retrying $targetModelId with text-only payload...")
+            if (errMsg.contains("500") || errMsg.contains("400") || errMsg.contains("503") || errMsg.contains("inlineData")) {
+                Log.d(TAG, "Image payload failed ($errMsg). Retrying $targetModelId with text-only payload...")
                 requestBodyJson = buildRequestBody(promptText, null)
-                result = executeApiCall(parsedUrl, requestBodyJson, mediaType)
+                result = executeApiCallWithRetry(parsedUrl, requestBodyJson, mediaType)
             }
         }
 
         result
     }
 
-    private fun executeApiCall(
+    private suspend fun executeApiCallWithRetry(
         parsedUrl: okhttp3.HttpUrl,
         requestBodyJson: JSONObject,
         mediaType: okhttp3.MediaType
     ): Result<CropAnalysisResult> {
-        val startTime = System.currentTimeMillis()
-        val safePath = parsedUrl.encodedPath
+        val maxAttempts = 3
+        var lastError = "Server Error"
 
-        Log.d(TAG, "Request Start -> Model: $targetModelId, Path: $safePath")
+        for (attempt in 1..maxAttempts) {
+            val startTime = System.currentTimeMillis()
+            val safePath = parsedUrl.encodedPath
 
-        return try {
-            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
-            val request = Request.Builder()
-                .url(parsedUrl)
-                .post(requestBody)
-                .build()
+            Log.d(TAG, "Request Start (Attempt $attempt/$maxAttempts) -> Model: $targetModelId, Path: $safePath")
 
-            val response = okHttpClient.newCall(request).execute()
-            val duration = System.currentTimeMillis() - startTime
-            val responseBodyString = response.body?.string() ?: ""
+            try {
+                val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
+                val request = Request.Builder()
+                    .url(parsedUrl)
+                    .post(requestBody)
+                    .build()
 
-            Log.d(TAG, "HTTP Response -> Model: $targetModelId, Code: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
+                val response = okHttpClient.newCall(request).execute()
+                val duration = System.currentTimeMillis() - startTime
+                val responseBodyString = response.body?.string() ?: ""
 
-            if (response.isSuccessful && responseBodyString.isNotBlank()) {
-                val parsedResult = parseGemmaResponse(responseBodyString)
-                if (parsedResult != null) {
-                    Result.success(parsedResult)
+                Log.d(TAG, "HTTP Response -> Status: ${response.code}, Duration: ${duration}ms, BodyLength: ${responseBodyString.length}")
+
+                if (response.isSuccessful && responseBodyString.isNotBlank()) {
+                    val parsedResult = parseGemmaResponse(responseBodyString)
+                    if (parsedResult != null) {
+                        return Result.success(parsedResult)
+                    } else {
+                        lastError = "Gemma AI response format unparseable."
+                    }
                 } else {
-                    Result.failure(
-                        Exception("Gemma AI response empty ya unreadable aaya.")
-                    )
+                    lastError = parseErrorMessage(response.code, responseBodyString)
+
+                    // Bounded retry with exponential backoff for transient server errors (500, 503, 429)
+                    if ((response.code == 500 || response.code == 503 || response.code == 429) && attempt < maxAttempts) {
+                        val retryAfterHeader = response.header("Retry-After")
+                        val backoffMs = if (retryAfterHeader != null) {
+                            (retryAfterHeader.toLongOrNull() ?: 1L).coerceAtMost(5L) * 1000L
+                        } else {
+                            1000L * attempt // 1s, 2s backoff
+                        }
+
+                        Log.w(TAG, "Transient HTTP ${response.code} error on attempt $attempt. Backing off for ${backoffMs}ms before retry...")
+                        delay(backoffMs)
+                        continue
+                    } else {
+                        return Result.failure(Exception(lastError))
+                    }
                 }
-            } else {
-                val errorMsg = parseErrorMessage(response.code, responseBodyString)
-                Result.failure(Exception(errorMsg))
+            } catch (e: UnknownHostException) {
+                val duration = System.currentTimeMillis() - startTime
+                Log.e(TAG, "UnknownHostException on attempt $attempt after ${duration}ms", e)
+                return Result.failure(
+                    Exception("Network Error: Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua.")
+                )
+            } catch (e: SocketTimeoutException) {
+                val duration = System.currentTimeMillis() - startTime
+                Log.e(TAG, "SocketTimeoutException on attempt $attempt after ${duration}ms", e)
+                if (attempt < maxAttempts) {
+                    delay(1000L * attempt)
+                    continue
+                }
+                return Result.failure(
+                    Exception("Gemma AI Server read timeout ($duration ms). Kripya dobara try karein.")
+                )
+            } catch (e: Exception) {
+                val duration = System.currentTimeMillis() - startTime
+                Log.e(TAG, "Exception (${e.javaClass.simpleName}) on attempt $attempt after ${duration}ms", e)
+                return Result.failure(
+                    Exception("Network Error: ${e.localizedMessage ?: e.message}")
+                )
             }
-        } catch (e: UnknownHostException) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "UnknownHostException after ${duration}ms", e)
-            Result.failure(
-                Exception("Network Error: Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua.")
-            )
-        } catch (e: SocketTimeoutException) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "SocketTimeoutException after ${duration}ms", e)
-            Result.failure(
-                Exception("Gemma AI Server read timeout ($duration ms). Kripya dobara try karein.")
-            )
-        } catch (e: Exception) {
-            val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "Exception (${e.javaClass.simpleName}) after ${duration}ms", e)
-            Result.failure(
-                Exception("Network Error: ${e.localizedMessage ?: e.message}")
-            )
         }
+
+        return Result.failure(Exception(lastError))
     }
 
     private fun buildPrompt(cropType: CropType, symptoms: String, hasImage: Boolean): String {
