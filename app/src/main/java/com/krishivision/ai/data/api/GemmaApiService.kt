@@ -20,18 +20,26 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 class GemmaApiService(private val context: Context) {
 
-    private val modelId = "gemma-4-31b-it".trim()
+    // Target Gemma models in order (Gemma 4 primary, fallback to official Gemma 2 models)
+    private val gemmaModels = listOf(
+        "gemma-4-31b-it",
+        "gemma-2-27b-it",
+        "gemma-2-9b-it",
+        "gemma-2-2b-it"
+    )
+
     private val expectedHost = "generativelanguage.googleapis.com"
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeCrop(
@@ -48,24 +56,49 @@ class GemmaApiService(private val context: Context) {
 
         val base64Image = if (imageUri != null) uriToBase64(imageUri) else null
         val promptText = buildPrompt(cropType, symptoms, base64Image != null)
-        val requestBodyJson = buildRequestBody(promptText, base64Image)
         val mediaType = "application/json; charset=utf-8".toMediaType()
 
-        val endpointUrl = "https://$expectedHost/v1beta/models/$modelId:generateContent?key=$apiKey"
-        val parsedUrl = endpointUrl.toHttpUrlOrNull()
+        var lastError = "Gemma API connection fail hua."
 
-        if (parsedUrl == null || parsedUrl.host != expectedHost) {
-            return@withContext Result.failure(
-                Exception("Invalid API Host constructed. Expected $expectedHost")
-            )
+        // Iterate over Gemma models
+        for (modelId in gemmaModels) {
+            val endpointUrl = "https://$expectedHost/v1beta/models/$modelId:generateContent?key=$apiKey"
+            val parsedUrl = endpointUrl.toHttpUrlOrNull() ?: continue
+
+            // First attempt: with image inlineData if present
+            var requestBodyJson = buildRequestBody(promptText, base64Image)
+            var result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
+
+            if (result.isSuccess) {
+                return@withContext result
+            }
+
+            // If 400 Bad Request occurred with image (due to text-only model), retry with text-only payload
+            if (base64Image != null && result.exceptionOrNull()?.message?.contains("400") == true) {
+                Log.d("GemmaApiService", "Retrying $modelId with text-only payload...")
+                requestBodyJson = buildRequestBody(promptText, null)
+                result = executeApiCall(parsedUrl, requestBodyJson, mediaType, modelId)
+                if (result.isSuccess) {
+                    return@withContext result
+                }
+            }
+
+            lastError = result.exceptionOrNull()?.message ?: lastError
         }
 
-        Log.d("GemmaApiService", "Making HTTPS request to host: ${parsedUrl.host}, path: ${parsedUrl.encodedPath}")
+        Result.failure(Exception(lastError))
+    }
 
-        try {
+    private fun executeApiCall(
+        parsedUrl: okhttp3.HttpUrl,
+        requestBodyJson: JSONObject,
+        mediaType: okhttp3.MediaType,
+        modelId: String
+    ): Result<CropAnalysisResult> {
+        return try {
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
             val request = Request.Builder()
-                .url(endpointUrl)
+                .url(parsedUrl)
                 .post(requestBody)
                 .build()
 
@@ -77,20 +110,24 @@ class GemmaApiService(private val context: Context) {
                 if (parsedResult != null) {
                     Result.success(parsedResult)
                 } else {
-                    Result.failure(Exception("Gemma 4 AI response ko parse nahi kiya ja saka."))
+                    Result.failure(Exception("Gemma AI ($modelId) response ko parse nahi kiya ja saka."))
                 }
             } else {
-                val errorMsg = parseErrorMessage(response.code, responseBodyString)
+                val errorMsg = parseErrorMessage(response.code, responseBodyString, modelId)
                 Result.failure(Exception(errorMsg))
             }
         } catch (e: UnknownHostException) {
-            Log.e("GemmaApiService", "DNS Lookup Failed for ${parsedUrl.host}", e)
             Result.failure(
-                Exception("Phone ka Internet/Wi-Fi disconnected hai! (Unable to resolve host: ${parsedUrl.host}). Kripya internet chalu karein.")
+                Exception("Mobile ka Internet/Wi-Fi off hai ya DNS lookup fail hua! Kripya Internet chalu karein.")
+            )
+        } catch (e: SocketTimeoutException) {
+            Result.failure(
+                Exception("Gemma AI Server timeout hua (30s). Kripya dobara koshish karein.")
             )
         } catch (e: Exception) {
-            Log.e("GemmaApiService", "Network error during Gemma 4 call", e)
-            Result.failure(Exception("Network error ($modelId): ${e.localizedMessage ?: e.message}"))
+            Result.failure(
+                Exception("Network Error ($modelId): ${e.localizedMessage ?: e.message}")
+            )
         }
     }
 
@@ -226,7 +263,7 @@ class GemmaApiService(private val context: Context) {
         )
     }
 
-    private fun parseErrorMessage(code: Int, body: String): String {
+    private fun parseErrorMessage(code: Int, body: String, modelId: String): String {
         return try {
             val root = JSONObject(body)
             val errorObj = root.optJSONObject("error")
